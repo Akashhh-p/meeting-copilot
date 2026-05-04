@@ -81,6 +81,10 @@ class MeetingTranscriber:
                 temperature=0
             )
             
+            segments_list = list(segments)
+            if not segments_list:
+                return ""
+            
             transcript_parts = []
             
             # Apply speaker diarization if available
@@ -88,38 +92,58 @@ class MeetingTranscriber:
                 try:
                     # Run diarization
                     diarization = self.diarization_pipeline(
-                        {"waveform": audio_chunk, "sample_rate": SAMPLE_RATE}
+                        {"waveform": audio_chunk.reshape(1, -1), "sample_rate": SAMPLE_RATE}
                     )
                     
-                    # Format output with speaker labels
+                    # Create speaker mapping from diarization
+                    speaker_segments = []
                     for segment, track, speaker_idx in diarization.itertracks(yield_label=True):
-                        for transcribed_segment in segments:
-                            # Match transcribed segments with speaker segments
-                            seg_start = transcribed_segment.start
-                            seg_end = transcribed_segment.end
-                            track_start = segment.start
-                            track_end = segment.end
+                        speaker_segments.append({
+                            'start': segment.start,
+                            'end': segment.end,
+                            'speaker': int(speaker_idx[0]) if isinstance(speaker_idx, np.ndarray) else int(speaker_idx)
+                        })
+                    
+                    # Match transcribed segments with speakers
+                    for transcribed_segment in segments_list:
+                        seg_start = transcribed_segment.start
+                        seg_end = transcribed_segment.end
+                        
+                        # Find the speaker with most overlap
+                        best_speaker = None
+                        best_overlap = 0
+                        
+                        for speaker_seg in speaker_segments:
+                            overlap_start = max(seg_start, speaker_seg['start'])
+                            overlap_end = min(seg_end, speaker_seg['end'])
+                            overlap = max(0, overlap_end - overlap_start)
                             
-                            # Simple overlap-based matching
-                            if not (seg_end < track_start or seg_start > track_end):
-                                speaker_label = self._get_speaker_label(int(speaker_idx[0]))
-                                timestamp = f"[{seg_start:.2f}s]"
-                                text = transcribed_segment.text.strip()
-                                if text:
-                                    transcript_parts.append(
-                                        f"{timestamp} {speaker_label}: {text}"
-                                    )
+                            if overlap > best_overlap:
+                                best_overlap = overlap
+                                best_speaker = speaker_seg['speaker']
+                        
+                        if best_speaker is not None:
+                            speaker_label = self._get_speaker_label(best_speaker)
+                        else:
+                            speaker_label = "Unknown"
+                        
+                        timestamp = f"[{seg_start:.2f}s]"
+                        text = transcribed_segment.text.strip()
+                        if text:
+                            transcript_parts.append(
+                                f"{timestamp} {speaker_label}: {text}"
+                            )
                         
                 except Exception as e:
                     logger.warning(f"Diarization failed: {e}. Using transcription only.")
-                    for segment in segments:
+                    for segment in segments_list:
                         timestamp = f"[{segment.start:.2f}s]"
                         text = segment.text.strip()
                         if text:
-                            transcript_parts.append(f"{timestamp} Unknown: {text}")
+                            transcript_parts.append(f"{timestamp} {text}")
             else:
                 # Fallback: transcription without speaker labels
-                for segment in segments:
+                for segment in segments_list:
                     timestamp = f"[{segment.start:.2f}s]"
                     text = segment.text.strip()
                     if text:
@@ -175,6 +199,16 @@ class MeetingTranscriber:
 
 def main():
     """Main entry point."""
+    import sys
+    
+    # Check for demo mode
+    demo_mode = "--demo" in sys.argv
+    
+    if demo_mode:
+        logger.info("Running in DEMO mode (no microphone required)")
+        demo_run()
+        return
+    
     # Get HuggingFace token from environment
     hf_token = os.getenv("HF_TOKEN")
     
@@ -186,6 +220,26 @@ def main():
     # Initialize and run transcriber
     transcriber = MeetingTranscriber(hf_token=hf_token)
     transcriber.run()
+
+
+def demo_run():
+    """Demo mode: Show what the output would look like without actual audio."""
+    logger.info("=" * 60)
+    logger.info("DEMO OUTPUT - What real transcription looks like:")
+    logger.info("=" * 60)
+    
+    demo_output = """
+[0.00s] Speaker A: Good morning everyone, thanks for joining the meeting
+[1.23s] Speaker B: Hi team, glad to be here. Let's start with the agenda
+[2.45s] Speaker A: Sure, first item is the Q2 roadmap review
+[3.67s] Speaker B: Great, I've prepared some slides on the upcoming features
+[5.12s] Speaker A: Perfect, let's dive into those now
+    """
+    print(demo_output)
+    logger.info("=" * 60)
+    logger.info("To run with real audio: python transcribe.py")
+    logger.info("Make sure HF_TOKEN is set for speaker diarization!")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":

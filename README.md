@@ -45,6 +45,12 @@ export HF_TOKEN="your_token_here"  # On Windows: set HF_TOKEN=your_token_here
 
 ### Usage
 
+**Demo mode (no microphone needed):**
+```bash
+python transcribe.py --demo
+```
+
+**Real-time transcription:**
 ```bash
 python transcribe.py
 ```
@@ -58,9 +64,11 @@ The transcriber will:
 ### Example Output
 
 ```
-[0.00s] Speaker A: Good morning everyone
-[1.23s] Speaker B: Hi, thanks for joining
-[2.45s] Speaker A: Let's start with the agenda
+[0.00s] Speaker A: Good morning everyone, thanks for joining
+[1.23s] Speaker B: Hi team, glad to be here. Let's start with the agenda
+[2.45s] Speaker A: Sure, first item is the Q2 roadmap review
+[3.67s] Speaker B: Great, I've prepared slides on the upcoming features
+[5.12s] Speaker A: Perfect, let's dive into those now
 ```
 
 ## How It Works
