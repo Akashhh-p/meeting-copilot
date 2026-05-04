@@ -42,7 +42,7 @@ class MeetingTranscriber:
         if hf_token:
             self.diarization_pipeline = Pipeline.from_pretrained(
                 "pyannote/speaker-diarization-3.0",
-                use_auth_token=hf_token
+                token=hf_token
             )
         else:
             logger.warning("No HuggingFace token provided. Speaker diarization may not work.")
