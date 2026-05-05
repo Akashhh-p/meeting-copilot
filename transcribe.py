@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-Real-time meeting transcription with speaker diarization.
-Captures audio from microphone in 3-second chunks and transcribes with speaker labels.
+Meeting Copilot - Real-time meeting transcription with transcripts saved to files.
+Records audio from microphone and transcribes with timestamps.
 """
 
 import os
 import sys
+import signal
+import json
 import numpy as np
 import sounddevice as sd
 from datetime import datetime
+from pathlib import Path
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 import logging
+import torch
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 # Setup logging
 logging.basicConfig(
@@ -21,58 +26,241 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-CHUNK_DURATION = 3  # seconds
+CHUNK_DURATION = 5  # seconds - captures multiple sentences per chunk
 SAMPLE_RATE = 16000  # Hz
 CHANNELS = 1
-DEVICE = None  # Use default device
+ENERGY_THRESHOLD = 0.02  # Minimum energy to consider as speech
+FINAL_DIARIZATION_TIMEOUT = 180  # seconds - final full-session diarization pass
+DIARIZATION_MODELS = (
+    "pyannote/speaker-diarization-community-1",
+    "pyannote/speaker-diarization-3.0",
+)
+
+# Global flag for graceful shutdown
+stop_recording = False
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully."""
+    global stop_recording
+    logger.info("\n\nSaving and shutting down...")
+    stop_recording = True
+
+def list_audio_devices():
+    """List all available audio input devices."""
+    print("\n" + "="*60)
+    print("AVAILABLE AUDIO DEVICES:")
+    print("="*60)
+    devices = sd.query_devices()
+    for i, device in enumerate(devices):
+        if device['max_input_channels'] > 0:
+            default = " [DEFAULT]" if i == sd.default.device[0] else ""
+            print(f"{i}: {device['name']} ({device['max_input_channels']} channels){default}")
+    print("="*60 + "\n")
+
+def select_audio_device():
+    """Allow user to select audio device."""
+    list_audio_devices()
+    try:
+        device_id = input("Enter device number (press Enter for default): ").strip()
+        if device_id == "":
+            device_id = None
+        else:
+            device_id = int(device_id)
+        return device_id
+    except ValueError:
+        logger.warning("Invalid input, using default device")
+        return None
+
+def detect_speech(audio_chunk):
+    """Detect if audio chunk contains speech."""
+    # Calculate RMS energy
+    rms_energy = np.sqrt(np.mean(audio_chunk**2))
+    
+    # Simple heuristic: speech has moderate energy.
+    has_speech = rms_energy > ENERGY_THRESHOLD
+    
+    return has_speech, rms_energy
 
 class MeetingTranscriber:
-    def __init__(self, hf_token: str = None):
+    def __init__(self, device=None, model_size="base", hf_token=None):
         """
-        Initialize the transcriber with Whisper and speaker diarization.
+        Initialize the transcriber.
         
         Args:
-            hf_token: HuggingFace token for accessing pyannote models
+            device: Audio device ID (None for default)
+            model_size: Whisper model size (tiny, base, small, medium, large)
+            hf_token: HuggingFace token for speaker diarization
         """
-        logger.info("Loading Whisper model...")
-        # Use tiny model for speed, can upgrade to base/small/medium for accuracy
-        self.model = WhisperModel("tiny", device="auto", compute_type="float32")
+        logger.info(f"Loading Whisper model ({model_size})...")
+        self.model = WhisperModel(
+            model_size,
+            device="cpu",
+            compute_type="float32"
+        )
         
+        # Load diarization pipeline
         logger.info("Loading speaker diarization pipeline...")
-        if hf_token:
-            self.diarization_pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.0",
-                token=hf_token
-            )
-        else:
-            logger.warning("No HuggingFace token provided. Speaker diarization may not work.")
-            logger.warning("Set HF_TOKEN environment variable or pass hf_token parameter.")
-            self.diarization_pipeline = None
-        
-        self.speaker_map = {}  # Map speaker indices to labels
+        self.diarization_pipeline = None
+        self.speaker_map = {}
         self.speaker_counter = 0
         
-    def _get_speaker_label(self, speaker_idx: int) -> str:
+        try:
+            if hf_token:
+                for diarization_model in DIARIZATION_MODELS:
+                    try:
+                        self.diarization_pipeline = Pipeline.from_pretrained(
+                            diarization_model,
+                            token=hf_token
+                        )
+                        if self.diarization_pipeline is not None:
+                            logger.info(f"Speaker diarization enabled ({diarization_model})")
+                            break
+                    except Exception as e:
+                        logger.warning(f"Could not load {diarization_model}: {e}")
+
+                if self.diarization_pipeline is None:
+                    raise RuntimeError("No diarization model could be loaded")
+            else:
+                logger.warning("No HuggingFace token provided. Speaker diarization disabled.")
+                logger.warning("To enable: set HF_TOKEN environment variable or pass --hf-token")
+        except Exception as e:
+            logger.warning(f"Failed to load diarization pipeline: {e}")
+            logger.warning("Continuing without speaker diarization")
+            self.diarization_pipeline = None
+        
+        self.device = device
+        self.session_start = datetime.now()
+        self.transcripts = []
+        self.audio_chunks = []
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        
+        # Create output directory
+        self.output_dir = Path("meeting_transcripts")
+        self.output_dir.mkdir(exist_ok=True)
+        
+        # Session file paths
+        session_name = self.session_start.strftime("%Y%m%d_%H%M%S")
+        self.session_dir = self.output_dir / session_name
+        self.session_dir.mkdir(exist_ok=True)
+        
+        self.transcript_file = self.session_dir / "transcript.txt"
+        self.json_file = self.session_dir / "transcript.json"
+        
+        logger.info(f"Session directory: {self.session_dir}")
+        logger.info(f"Transcripts will be saved to: {self.transcript_file}")
+    
+    def _get_speaker_label(self, speaker_idx) -> str:
         """Get or create a consistent label for a speaker."""
         if speaker_idx not in self.speaker_map:
             self.speaker_map[speaker_idx] = f"Speaker {chr(65 + self.speaker_counter)}"
             self.speaker_counter += 1
         return self.speaker_map[speaker_idx]
     
-    def transcribe_chunk(self, audio_chunk: np.ndarray) -> str:
+    def _diarize_audio(self, audio_chunk: np.ndarray) -> dict:
         """
-        Transcribe a single audio chunk and add speaker labels.
+        Run diarization on audio chunk with timeout protection.
+        Returns a mapping of timestamps to speakers.
+        """
+        if not self.diarization_pipeline:
+            return {}
+        
+        try:
+            # Prepare audio in pyannote format
+            audio_dict = {
+                "waveform": torch.from_numpy(audio_chunk).unsqueeze(0).float(),
+                "sample_rate": SAMPLE_RATE
+            }
+            
+            # Run diarization with timeout
+            diarization = self.diarization_pipeline(audio_dict)
+            
+            # Extract speaker segments
+            speaker_map = {}
+            for segment, track, speaker_id in diarization.itertracks(yield_label=True):
+                speaker_map[(segment.start, segment.end)] = speaker_id
+            
+            return speaker_map
+            
+        except Exception as e:
+            logger.warning(f"Diarization error (non-fatal): {e}")
+            return {}
+    
+    def _find_speaker_for_segment(self, segment_start, segment_end, speaker_map) -> str:
+        """Find the speaker that overlaps most with the given segment."""
+        if not speaker_map:
+            return "Unknown"
+        
+        best_speaker = None
+        best_overlap = 0
+        
+        for (sp_start, sp_end), speaker_id in speaker_map.items():
+            overlap_start = max(segment_start, sp_start)
+            overlap_end = min(segment_end, sp_end)
+            overlap = max(0, overlap_end - overlap_start)
+            
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_speaker = speaker_id
+        
+        if best_speaker is not None:
+            return self._get_speaker_label(best_speaker)
+        return "Unknown"
+    
+    def _apply_speaker_labels(self, speaker_map: dict):
+        """Apply diarization labels to all saved transcript segments."""
+        if not speaker_map:
+            return
+
+        for chunk_data in self.transcripts:
+            for segment in chunk_data["segments"]:
+                speaker = self._find_speaker_for_segment(
+                    segment["start"], segment["end"], speaker_map
+                )
+                segment["speaker"] = speaker
+
+    def _diarize_full_session(self):
+        """Run one full-session diarization pass before saving final output."""
+        if not self.diarization_pipeline or not self.audio_chunks:
+            return
+
+        try:
+            logger.info("Running final speaker diarization pass...")
+            full_audio = np.concatenate(self.audio_chunks).astype(np.float32)
+            future = self.executor.submit(self._diarize_audio, full_audio)
+            speaker_map = future.result(timeout=FINAL_DIARIZATION_TIMEOUT)
+            if speaker_map:
+                self._apply_speaker_labels(speaker_map)
+                logger.info(f"Final diarization found {len(self.speaker_map)} speaker(s)")
+            else:
+                logger.warning("Final diarization returned no speaker segments")
+        except FuturesTimeoutError:
+            logger.warning("Final diarization timeout, saving transcript without speaker labels")
+        except Exception as e:
+            logger.warning(f"Final diarization failed: {e}")
+
+    def transcribe_chunk(self, audio_chunk: np.ndarray, chunk_num: int) -> dict:
+        """
+        Transcribe a single audio chunk with speaker diarization.
         
         Args:
             audio_chunk: Audio data as numpy array
+            chunk_num: Chunk number for tracking
             
         Returns:
-            Formatted transcript with speaker labels and timestamps
+            Dictionary with transcription data or None if no speech
         """
         if len(audio_chunk) == 0:
-            return ""
+            return None
+        
+        # Detect if chunk has speech
+        has_speech, energy = detect_speech(audio_chunk)
+        if not has_speech:
+            logger.debug(f"Chunk {chunk_num}: No speech detected (energy: {energy:.4f})")
+            return None
         
         try:
+            logger.info(f"Chunk {chunk_num}: Transcribing (energy: {energy:.4f})...")
+            
             # Transcribe with Whisper
             segments, info = self.model.transcribe(
                 audio_chunk,
@@ -82,164 +270,190 @@ class MeetingTranscriber:
             )
             
             segments_list = list(segments)
+            
             if not segments_list:
-                return ""
+                logger.debug(f"Chunk {chunk_num}: No speech recognized")
+                return None
             
-            transcript_parts = []
+            # Speaker labels are assigned in a final full-session pass before saving.
+            # Very short chunks often do not give pyannote enough context.
+            speaker_map = {}
             
-            # Apply speaker diarization if available
-            if self.diarization_pipeline:
-                try:
-                    # Run diarization
-                    diarization = self.diarization_pipeline(
-                        {"waveform": audio_chunk.reshape(1, -1), "sample_rate": SAMPLE_RATE}
+            # Process segments
+            chunk_data = {
+                "chunk_num": chunk_num,
+                "timestamp": datetime.now().isoformat(),
+                "duration": len(audio_chunk) / SAMPLE_RATE,
+                "segments": []
+            }
+            chunk_start = (chunk_num - 1) * CHUNK_DURATION
+            
+            for segment in segments_list:
+                text = segment.text.strip()
+                if text:
+                    # Get speaker label if diarization available
+                    speaker = self._find_speaker_for_segment(
+                        segment.start, segment.end, speaker_map
                     )
                     
-                    # Create speaker mapping from diarization
-                    speaker_segments = []
-                    for segment, track, speaker_idx in diarization.itertracks(yield_label=True):
-                        speaker_segments.append({
-                            'start': segment.start,
-                            'end': segment.end,
-                            'speaker': int(speaker_idx[0]) if isinstance(speaker_idx, np.ndarray) else int(speaker_idx)
-                        })
+                    # Format output
+                    speaker_prefix = f"{speaker}: " if speaker != "Unknown" else ""
                     
-                    # Match transcribed segments with speakers
-                    for transcribed_segment in segments_list:
-                        seg_start = transcribed_segment.start
-                        seg_end = transcribed_segment.end
-                        
-                        # Find the speaker with most overlap
-                        best_speaker = None
-                        best_overlap = 0
-                        
-                        for speaker_seg in speaker_segments:
-                            overlap_start = max(seg_start, speaker_seg['start'])
-                            overlap_end = min(seg_end, speaker_seg['end'])
-                            overlap = max(0, overlap_end - overlap_start)
-                            
-                            if overlap > best_overlap:
-                                best_overlap = overlap
-                                best_speaker = speaker_seg['speaker']
-                        
-                        if best_speaker is not None:
-                            speaker_label = self._get_speaker_label(best_speaker)
-                        else:
-                            speaker_label = "Unknown"
-                        
-                        timestamp = f"[{seg_start:.2f}s]"
-                        text = transcribed_segment.text.strip()
-                        if text:
-                            transcript_parts.append(
-                                f"{timestamp} {speaker_label}: {text}"
-                            )
-                        
-                except Exception as e:
-                    logger.warning(f"Diarization failed: {e}. Using transcription only.")
-                    for segment in segments_list:
-                        timestamp = f"[{segment.start:.2f}s]"
-                        text = segment.text.strip()
-                        if text:
-                            transcript_parts.append(f"{timestamp} {text}")
-            else:
-                # Fallback: transcription without speaker labels
-                for segment in segments_list:
-                    timestamp = f"[{segment.start:.2f}s]"
-                    text = segment.text.strip()
-                    if text:
-                        transcript_parts.append(f"{timestamp} {text}")
+                    segment_data = {
+                        "start": round(chunk_start + segment.start, 2),
+                        "end": round(chunk_start + segment.end, 2),
+                        "speaker": speaker,
+                        "text": text
+                    }
+                    chunk_data["segments"].append(segment_data)
+                    logger.info(f"  [{segment.start:.2f}s - {segment.end:.2f}s] {speaker_prefix}{text}")
             
-            return "\n".join(transcript_parts)
+            if chunk_data["segments"]:
+                return chunk_data
+            else:
+                logger.debug(f"Chunk {chunk_num}: No text extracted from segments")
+                return None
             
         except Exception as e:
-            logger.error(f"Transcription error: {e}")
-            return ""
+            logger.error(f"Transcription error on chunk {chunk_num}: {e}")
+            return None
+    
+    def save_transcript(self):
+        """Save accumulated transcripts to files."""
+        if not self.transcripts:
+            logger.info("No transcriptions to save")
+            return
+        
+        try:
+            self._diarize_full_session()
+
+            # Save as text file with speaker labels
+            with open(self.transcript_file, "w") as f:
+                f.write(f"MEETING TRANSCRIPT\n")
+                f.write(f"Started: {self.session_start.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                if self.speaker_map:
+                    f.write(f"Speakers: {', '.join(self.speaker_map.values())}\n")
+                f.write("="*60 + "\n\n")
+                
+                for chunk_data in self.transcripts:
+                    for segment in chunk_data["segments"]:
+                        speaker = segment.get("speaker", "Unknown")
+                        speaker_label = f"{speaker}: " if speaker != "Unknown" else ""
+                        f.write(f"[{segment['start']:.2f}s - {segment['end']:.2f}s] {speaker_label}{segment['text']}\n")
+            
+            logger.info(f"Transcript saved to: {self.transcript_file}")
+            
+            # Save as JSON for structured data
+            with open(self.json_file, "w") as f:
+                json.dump({
+                    "session_start": self.session_start.isoformat(),
+                    "session_end": datetime.now().isoformat(),
+                    "speakers": list(self.speaker_map.values()),
+                    "chunks": self.transcripts
+                }, f, indent=2)
+            
+            logger.info(f"JSON transcript saved to: {self.json_file}")
+            
+        except Exception as e:
+            logger.error(f"Error saving transcript: {e}")
     
     def run(self):
         """Start real-time transcription from microphone."""
-        logger.info(f"Starting real-time transcription. Recording {CHUNK_DURATION}s chunks...")
-        logger.info("Press Ctrl+C to stop.")
-        logger.info("-" * 60)
+        global stop_recording
         
-        try:
-            while True:
+        # Register signal handler for Ctrl+C
+        signal.signal(signal.SIGINT, signal_handler)
+        
+        logger.info("="*60)
+        logger.info("MEETING COPILOT - Real-time Transcription")
+        logger.info("="*60)
+        logger.info(f"Recording {CHUNK_DURATION}s chunks at {SAMPLE_RATE}Hz")
+        logger.info("Press Ctrl+C to stop and save transcript.")
+        logger.info("-"*60)
+        
+        chunk_num = 0
+        
+        while not stop_recording:
+            try:
+                chunk_num += 1
+                logger.info(f"\n[CHUNK {chunk_num}] Recording at {datetime.now().strftime('%H:%M:%S')}...")
+                
                 # Record audio chunk
-                logger.info(f"Recording chunk at {datetime.now().strftime('%H:%M:%S')}...")
-                audio_chunk = sd.rec(
-                    int(CHUNK_DURATION * SAMPLE_RATE),
-                    samplerate=SAMPLE_RATE,
-                    channels=CHANNELS,
-                    device=DEVICE,
-                    dtype=np.float32,
-                    blocksize=4096
-                )
-                sd.wait()  # Wait for recording to complete
+                try:
+                    audio_chunk = sd.rec(
+                        int(CHUNK_DURATION * SAMPLE_RATE),
+                        samplerate=SAMPLE_RATE,
+                        channels=CHANNELS,
+                        device=self.device,
+                        dtype=np.float32,
+                        blocksize=4096
+                    )
+                    sd.wait()  # Wait for recording to complete
+                    
+                except Exception as e:
+                    logger.error(f"Audio recording error: {e}")
+                    logger.error("Try running with --select-device to choose a different audio input")
+                    continue
                 
                 # Flatten if stereo was recorded
                 if len(audio_chunk.shape) > 1:
                     audio_chunk = np.mean(audio_chunk, axis=1)
                 
+                # Normalize audio
+                max_val = np.max(np.abs(audio_chunk))
+                if max_val > 0:
+                    audio_chunk = audio_chunk / max_val
+                self.audio_chunks.append(audio_chunk.copy())
+                
                 # Transcribe
-                transcript = self.transcribe_chunk(audio_chunk)
+                result = self.transcribe_chunk(audio_chunk, chunk_num)
                 
-                if transcript:
-                    print("\n" + transcript + "\n")
-                else:
-                    print("[Silent or unrecognized]")
+                if result:
+                    self.transcripts.append(result)
+                    logger.info(f"✓ Chunk {chunk_num} transcribed successfully")
                 
-                logger.info("-" * 60)
+                logger.info("-"*60)
                 
-        except KeyboardInterrupt:
-            logger.info("\nTranscription stopped by user.")
-            sys.exit(0)
-        except Exception as e:
-            logger.error(f"Fatal error: {e}")
-            sys.exit(1)
+            except Exception as e:
+                logger.error(f"Error during chunk {chunk_num}: {e}")
+                continue
+        
+        # Save transcript when done
+        logger.info("\nFinalizing session...")
+        self.save_transcript()
+        self.executor.shutdown(wait=False)
+        logger.info("Session complete!")
 
 
 def main():
     """Main entry point."""
-    import sys
+    import argparse
     
-    # Check for demo mode
-    demo_mode = "--demo" in sys.argv
+    parser = argparse.ArgumentParser(description="Meeting Copilot - Real-time transcription with speaker diarization")
+    parser.add_argument("--model", choices=["tiny", "base", "small", "medium", "large"],
+                       default="base", help="Whisper model size")
+    parser.add_argument("--device", type=int, default=None, help="Audio device ID")
+    parser.add_argument("--select-device", action="store_true", help="Interactive device selection")
+    parser.add_argument("--hf-token", type=str, default=None, help="HuggingFace token for speaker diarization")
     
-    if demo_mode:
-        logger.info("Running in DEMO mode (no microphone required)")
-        demo_run()
-        return
+    args = parser.parse_args()
     
-    # Get HuggingFace token from environment
-    hf_token = os.getenv("HF_TOKEN")
+    # Get HuggingFace token from argument or environment
+    hf_token = args.hf_token or os.getenv("HF_TOKEN")
     
-    if not hf_token:
-        logger.warning("HF_TOKEN environment variable not set.")
-        logger.warning("Speaker diarization will be disabled.")
-        logger.info("To enable: export HF_TOKEN='your_huggingface_token'")
+    device = args.device
+    if args.select_device:
+        device = select_audio_device()
     
-    # Initialize and run transcriber
-    transcriber = MeetingTranscriber(hf_token=hf_token)
-    transcriber.run()
-
-
-def demo_run():
-    """Demo mode: Show what the output would look like without actual audio."""
-    logger.info("=" * 60)
-    logger.info("DEMO OUTPUT - What real transcription looks like:")
-    logger.info("=" * 60)
-    
-    demo_output = """
-[0.00s] Speaker A: Good morning everyone, thanks for joining the meeting
-[1.23s] Speaker B: Hi team, glad to be here. Let's start with the agenda
-[2.45s] Speaker A: Sure, first item is the Q2 roadmap review
-[3.67s] Speaker B: Great, I've prepared some slides on the upcoming features
-[5.12s] Speaker A: Perfect, let's dive into those now
-    """
-    print(demo_output)
-    logger.info("=" * 60)
-    logger.info("To run with real audio: python transcribe.py")
-    logger.info("Make sure HF_TOKEN is set for speaker diarization!")
-    logger.info("=" * 60)
+    try:
+        transcriber = MeetingTranscriber(device=device, model_size=args.model, hf_token=hf_token)
+        transcriber.run()
+    except KeyboardInterrupt:
+        logger.info("\nShutdown complete.")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

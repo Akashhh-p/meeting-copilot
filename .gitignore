@@ -44,6 +44,7 @@ Thumbs.db
 *.m4a
 *.flac
 transcripts/
+meeting_transcripts/
 models/
 audio_cache/
 

@@ -1,103 +1,219 @@
 # Meeting Copilot
 
-Real-time meeting transcription with speaker labels using Whisper and pyannote speaker diarization.
+Real-time meeting transcription with automatic transcript saving. Captures audio from your microphone and transcribes it using OpenAI's Whisper model.
 
 ## Features
 
-- 🎤 Real-time microphone audio capture in 3-second chunks
-- 🎯 Accurate speech-to-text using Faster Whisper
-- 👥 Speaker identification and labeling with pyannote
-- ⏱️ Timestamped transcript output
-- 🚀 Fast inference on CPU or GPU
+✅ **Real-time Transcription** - Transcribe audio as you record  
+✅ **Speaker Diarization** - Identifies and labels different speakers (Speaker A, Speaker B, etc.)  
+✅ **Automatic Session Management** - Each session saved in a timestamped folder  
+✅ **Text & JSON Output** - Save transcripts in both human-readable and structured formats  
+✅ **Audio Device Selection** - Choose which microphone to use  
+✅ **Speech Detection** - Only processes chunks that contain actual speech  
+✅ **Multiple Model Sizes** - Tiny, base, small, medium, or large Whisper models  
+✅ **CPU-based** - Works without CUDA/GPU (with timeout protection)  
 
-## Quick Start
+## Installation
 
-### Prerequisites
+1. **Create a virtual environment:**
+   ```bash
+   python -m venv venv
+   ```
 
-- Python 3.8+
-- Working microphone
-- HuggingFace account (free) for speaker diarization
+2. **Activate it:**
+   - Windows: `venv\Scripts\activate.ps1`
+   - Linux/Mac: `source venv/bin/activate`
 
-### Installation
+3. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-1. **Clone and setup**
-```bash
-git clone https://github.com/yourusername/meeting-copilot
-cd meeting-copilot
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
+4. **Get HuggingFace token (optional but recommended for speaker diarization):**
+   - Go to https://huggingface.co/settings/tokens
+   - Create a **read-only** token
+   - Accept the model license at https://huggingface.co/pyannote/speaker-diarization-3.0
+   - Set environment variable (Windows PowerShell):
+     ```powershell
+     $env:HF_TOKEN = "your_token_here"
+     ```
+   - Or Linux/Mac:
+     ```bash
+     export HF_TOKEN="your_token_here"
+     ```
 
-2. **Install dependencies**
-```bash
-pip install faster-whisper pyannote.audio sounddevice numpy torch
-```
+## Usage
 
-3. **Get HuggingFace token**
-- Go to https://huggingface.co/settings/tokens
-- Create a read token
-- Accept the model license at https://huggingface.co/pyannote/speaker-diarization-3.0
-
-4. **Set environment variable**
-```bash
-export HF_TOKEN="your_token_here"  # On Windows: set HF_TOKEN=your_token_here
-```
-
-### Usage
-
-**Demo mode (no microphone needed):**
-```bash
-python transcribe.py --demo
-```
-
-**Real-time transcription:**
+### Basic Usage (Default Device)
 ```bash
 python transcribe.py
 ```
 
-The transcriber will:
-1. Record 3-second audio chunks from your microphone
-2. Transcribe each chunk with speaker labels
-3. Display timestamped output in the terminal
-4. Continue until you press Ctrl+C
-
-### Example Output
-
+### Select Audio Device Interactively
+```bash
+python transcribe.py --select-device
 ```
-[0.00s] Speaker A: Good morning everyone, thanks for joining
-[1.23s] Speaker B: Hi team, glad to be here. Let's start with the agenda
-[2.45s] Speaker A: Sure, first item is the Q2 roadmap review
-[3.67s] Speaker B: Great, I've prepared slides on the upcoming features
-[5.12s] Speaker A: Perfect, let's dive into those now
+This will show all available microphones and let you choose one.
+
+### Choose a Specific Device
+```bash
+python transcribe.py --device 0
+```
+
+### Use Different Model Size
+```bash
+python transcribe.py --model small
+```
+
+Model options: `tiny` (fastest), `base` (recommended), `small`, `medium`, `large` (most accurate)
+
+### Combined Example
+```bash
+python transcribe.py --select-device --model medium --hf-token your_token_here
+```
+
+### With Environment Variable (Recommended)
+```powershell
+$env:HF_TOKEN = "your_huggingface_token"
+python transcribe.py --select-device --model base
+```
+
+The token can also be passed via command line:
+```bash
+python transcribe.py --hf-token "your_token_here"
 ```
 
 ## How It Works
 
-### Audio Capture
-- Records continuous audio from the default microphone
-- Processes in 3-second chunks for real-time responsiveness
+1. **Recording** - Captures 5-second chunks of audio
+2. **Speech Detection** - Analyzes audio energy to detect if speech is present
+3. **Transcription** - Sends speech chunks to Whisper for transcription
+4. **Speaker Diarization** - Identifies different speakers (requires HuggingFace token)
+5. **Storage** - Saves transcripts in real-time and on exit
+6. **Output** - Creates a timestamped folder with transcript files
 
-### Transcription
-- Uses Faster Whisper (quantized version of OpenAI Whisper)
-- Lightweight "tiny" model by default (fast, good for meetings)
-- Can upgrade to "base", "small", "medium" for higher accuracy
+### Speaker Diarization Details
+- Uses **pyannote 3.0** speaker diarization model
+- Automatically identifies and labels different speakers
+- Maps speaker IDs to consistent labels (Speaker A, Speaker B, etc.)
+- **Timeout protection:** 10-second timeout prevents freezes on CPU
+- **Non-blocking:** Runs in background thread without blocking transcription
+- **Graceful fallback:** If diarization fails, continues with timestamps only
 
-### Speaker Diarization
-- Uses pyannote 3.0 speaker diarization model
-- Identifies and labels different speakers automatically
-- Maps speaker IDs to consistent labels (Speaker A, B, etc.)
+## Output Files
 
-## Configuration
+Transcripts are saved in `meeting_transcripts/YYYYMMDD_HHMMSS/`:
+- `transcript.txt` - Human-readable format with timestamps
+- `transcript.json` - Structured JSON format for parsing
 
-Edit `transcribe.py` to adjust:
-- `CHUNK_DURATION`: Change chunk size (default: 3 seconds)
-- `SAMPLE_RATE`: Audio sample rate (default: 16000 Hz)
-- Model size: Change from "tiny" to "base", "small", or "medium"
+Example:
+```
+meeting_transcripts/
+└── 20260505_100932/
+    ├── transcript.txt
+    └── transcript.json
+```
+
+### Example Transcript Format
+
+**transcript.txt:**
+```
+MEETING TRANSCRIPT
+Started: 2026-05-05 10:09:32
+Ended: 2026-05-05 10:10:15
+Speakers: Speaker A, Speaker B
+============================================================
+
+[0.00s - 1.25s] Speaker A: Good morning everyone, let's start the meeting
+[1.50s - 3.20s] Speaker B: Today we'll discuss the new product roadmap
+[3.45s - 5.10s] Speaker A: First, let me share some updates on Q2 plans
+```
+
+**transcript.json:**
+```json
+{
+  "session_start": "2026-05-05T10:09:32.123456",
+  "session_end": "2026-05-05T10:10:15.654321",
+  "speakers": ["Speaker A", "Speaker B"],
+  "chunks": [
+    {
+      "chunk_num": 1,
+      "timestamp": "2026-05-05T10:09:35.234567",
+      "segments": [
+        {
+          "start": 0.0,
+          "end": 1.25,
+          "speaker": "Speaker A",
+          "text": "Good morning everyone, let's start the meeting"
+        }
+      ]
+    }
+  ]
+}
+```
 
 ## Troubleshooting
 
-**"No module named 'sounddevice'"**
-- Reinstall: `pip install --upgrade sounddevice`
+### No Audio is Being Recorded
+- Run with `--select-device` to list and choose the correct microphone
+- Check your system volume is not muted
+- Ensure microphone permissions are granted
+
+### Speaker Diarization Not Working
+- **Missing HuggingFace token:** Get one from https://huggingface.co/settings/tokens
+- **Invalid token:** Make sure to create a READ token, not a write token
+- **Model license not accepted:** Accept the license at https://huggingface.co/pyannote/speaker-diarization-3.0
+- **Timeout issues:** Diarization has a 10-second timeout on CPU. If it times out, it continues without speaker labels (non-fatal)
+
+### Wrong Audio Device Being Used
+```bash
+python transcribe.py --select-device
+# Choose the correct device number
+```
+
+### Slow Transcription
+Use the smaller model:
+```bash
+python transcribe.py --model tiny
+```
+
+### Missing Dependencies
+Reinstall requirements:
+```bash
+pip install -r requirements.txt --force-reinstall
+```
+
+## Tips for Best Results
+
+1. **Speak clearly** - Whisper works better with clear speech
+2. **Minimal background noise** - Reduce ambient noise for better accuracy
+3. **Use `base` or `small` model** - Good balance between speed and accuracy
+4. **Shorter chunks** - Current 2-second chunks work well for real-time transcription
+
+## Controls
+
+- **Ctrl+C** - Stop recording and save transcript
+- The app will save your transcript automatically
+
+## Model Comparison
+
+| Model | Speed | Accuracy | Memory | Recommended For |
+|-------|-------|----------|--------|-----------------|
+| tiny | ⚡⚡⚡ | ⭐ | ✓ | Testing, demos |
+| base | ⚡⚡ | ⭐⭐⭐ | ✓ | **Default choice** |
+| small | ⚡ | ⭐⭐⭐⭐ | ✓✓ | Better accuracy |
+| medium | - | ⭐⭐⭐⭐⭐ | ✓✓✓ | High accuracy |
+| large | - | ⭐⭐⭐⭐⭐ | ✓✓✓✓ | Maximum accuracy |
+
+## Requirements
+
+- Python 3.8+
+- Microphone
+- ~500MB disk space for base model (more for larger models)
+
+## License
+
+MIT
 
 **"No microphone detected"**
 - Check system audio settings

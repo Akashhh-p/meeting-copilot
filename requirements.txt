@@ -2,4 +2,4 @@ faster-whisper==1.2.1
 pyannote.audio==4.0.4
 sounddevice==0.5.5
 numpy==2.2.6
-torch==2.11.0
+torch==2.11.0+cpu -f https://download.pytorch.org/whl/torch_stable.html
