@@ -13,7 +13,6 @@ import sounddevice as sd
 from datetime import datetime
 from pathlib import Path
 from faster_whisper import WhisperModel
-from pyannote.audio import Pipeline
 import logging
 import torch
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -30,7 +29,17 @@ CHUNK_DURATION = 5  # seconds - captures multiple sentences per chunk
 SAMPLE_RATE = 16000  # Hz
 CHANNELS = 1
 ENERGY_THRESHOLD = 0.02  # Minimum energy to consider as speech
+LOW_AUDIO_WARNING_THRESHOLD = float(os.getenv("LOW_AUDIO_WARNING_THRESHOLD", "0.003"))
+AUDIO_INPUT_GAIN = float(os.getenv("AUDIO_INPUT_GAIN", "1.5"))
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+COMPUTE_TYPE = "float16" if DEVICE == "cuda" else "int8"
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "3"))
 FINAL_DIARIZATION_TIMEOUT = 180  # seconds - final full-session diarization pass
+DIARIZATION_NUM_SPEAKERS = os.getenv("DIARIZATION_NUM_SPEAKERS")
+DIARIZATION_MIN_SPEAKERS = int(os.getenv("DIARIZATION_MIN_SPEAKERS", "1"))
+DIARIZATION_MAX_SPEAKERS = int(os.getenv("DIARIZATION_MAX_SPEAKERS", "4"))
+DIARIZATION_SHORT_TURN_SECONDS = float(os.getenv("DIARIZATION_SHORT_TURN_SECONDS", "0.6"))
+DIARIZATION_MERGE_GAP_SECONDS = float(os.getenv("DIARIZATION_MERGE_GAP_SECONDS", "0.4"))
 DIARIZATION_MODELS = (
     "pyannote/speaker-diarization-community-1",
     "pyannote/speaker-diarization-3.0",
@@ -51,11 +60,55 @@ def list_audio_devices():
     print("AVAILABLE AUDIO DEVICES:")
     print("="*60)
     devices = sd.query_devices()
+    default_in, default_out = sd.default.device
     for i, device in enumerate(devices):
-        if device['max_input_channels'] > 0:
-            default = " [DEFAULT]" if i == sd.default.device[0] else ""
-            print(f"{i}: {device['name']} ({device['max_input_channels']} channels){default}")
+        markers = []
+        if i == default_in:
+            markers.append("DEFAULT INPUT")
+        if i == default_out:
+            markers.append("DEFAULT OUTPUT")
+        marker = f" [{' / '.join(markers)}]" if markers else ""
+        print(
+            f"{i}: {device['name']} | input={device['max_input_channels']} "
+            f"output={device['max_output_channels']} rate={device['default_samplerate']}{marker}"
+        )
     print("="*60 + "\n")
+
+
+def debug_audio(device=None, seconds=30):
+    """Print per-second RMS/peak/queue-style audio diagnostics without loading ML models."""
+    print("\nAUDIO DEBUG")
+    print("=" * 60)
+    list_audio_devices()
+    print(f"Selected device: {device if device is not None else 'default'}")
+    print(f"Sample rate: {SAMPLE_RATE} Hz")
+    print(f"Channels: {CHANNELS}")
+    print(f"Input gain: {AUDIO_INPUT_GAIN}")
+    print("Press Ctrl+C to stop.\n")
+    frames = int(SAMPLE_RATE)
+    try:
+        for second in range(1, seconds + 1):
+            audio = sd.rec(
+                frames,
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                device=device,
+                dtype=np.float32,
+                blocksize=4096,
+            )
+            sd.wait()
+            mono = audio.mean(axis=1) if audio.ndim == 2 else audio.reshape(-1)
+            mono = np.clip(mono * AUDIO_INPUT_GAIN, -1.0, 1.0)
+            rms = float(np.sqrt(np.mean(mono**2))) if len(mono) else 0.0
+            peak = float(np.max(np.abs(mono))) if len(mono) else 0.0
+            speech = rms > ENERGY_THRESHOLD or peak > 0.01
+            low = 0 < rms < LOW_AUDIO_WARNING_THRESHOLD
+            print(
+                f"{second:03d}s rms={rms:.6f} peak={peak:.6f} "
+                f"speech_detected={speech} low_audio={low} queued=1 queue_size=0"
+            )
+    except KeyboardInterrupt:
+        print("\nAudio debug stopped.")
 
 def select_audio_device():
     """Allow user to select audio device."""
@@ -81,6 +134,14 @@ def detect_speech(audio_chunk):
     
     return has_speech, rms_energy
 
+
+def format_timestamp(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
 class MeetingTranscriber:
     def __init__(self, device=None, model_size="base", hf_token=None):
         """
@@ -94,8 +155,8 @@ class MeetingTranscriber:
         logger.info(f"Loading Whisper model ({model_size})...")
         self.model = WhisperModel(
             model_size,
-            device="cpu",
-            compute_type="float32"
+            device=DEVICE,
+            compute_type=COMPUTE_TYPE
         )
         
         # Load diarization pipeline
@@ -108,6 +169,8 @@ class MeetingTranscriber:
             if hf_token:
                 for diarization_model in DIARIZATION_MODELS:
                     try:
+                        from pyannote.audio import Pipeline
+
                         self.diarization_pipeline = Pipeline.from_pretrained(
                             diarization_model,
                             token=hf_token
@@ -171,19 +234,78 @@ class MeetingTranscriber:
                 "sample_rate": SAMPLE_RATE
             }
             
-            # Run diarization with timeout
-            diarization = self.diarization_pipeline(audio_dict)
+            # Run diarization. Defaulting min speakers to 1 avoids forcing
+            # one-person recordings to be split into multiple speakers.
+            diarization = self.diarization_pipeline(
+                audio_dict,
+                **self._diarization_speaker_options()
+            )
             
             # Extract speaker segments
             speaker_map = {}
             for segment, track, speaker_id in diarization.itertracks(yield_label=True):
                 speaker_map[(segment.start, segment.end)] = speaker_id
             
-            return speaker_map
+            return self._normalize_speaker_map(self._stabilize_speaker_map(speaker_map))
             
         except Exception as e:
             logger.warning(f"Diarization error (non-fatal): {e}")
             return {}
+
+    def _diarization_speaker_options(self) -> dict:
+        if DIARIZATION_NUM_SPEAKERS:
+            return {"num_speakers": int(DIARIZATION_NUM_SPEAKERS)}
+        return {
+            "min_speakers": DIARIZATION_MIN_SPEAKERS,
+            "max_speakers": max(DIARIZATION_MIN_SPEAKERS, DIARIZATION_MAX_SPEAKERS),
+        }
+
+    def _stabilize_speaker_map(self, speaker_map: dict) -> dict:
+        if not speaker_map:
+            return {}
+
+        segments = [
+            {"start": start, "end": end, "speaker": speaker}
+            for (start, end), speaker in speaker_map.items()
+        ]
+        segments.sort(key=lambda item: (item["start"], item["end"]))
+
+        for index in range(1, len(segments) - 1):
+            current = segments[index]
+            previous = segments[index - 1]
+            following = segments[index + 1]
+            duration = current["end"] - current["start"]
+            if (
+                duration < DIARIZATION_SHORT_TURN_SECONDS
+                and previous["speaker"] == following["speaker"]
+                and current["speaker"] != previous["speaker"]
+            ):
+                current["speaker"] = previous["speaker"]
+
+        merged = []
+        for segment in segments:
+            if (
+                merged
+                and merged[-1]["speaker"] == segment["speaker"]
+                and segment["start"] - merged[-1]["end"] <= DIARIZATION_MERGE_GAP_SECONDS
+            ):
+                merged[-1]["end"] = max(merged[-1]["end"], segment["end"])
+            else:
+                merged.append(dict(segment))
+
+        return {
+            (segment["start"], segment["end"]): segment["speaker"]
+            for segment in merged
+        }
+
+    def _normalize_speaker_map(self, speaker_map: dict) -> dict:
+        normalized = {}
+        raw_to_stable = {}
+        for (start, end), speaker in sorted(speaker_map.items()):
+            if speaker not in raw_to_stable:
+                raw_to_stable[speaker] = f"SPEAKER_{len(raw_to_stable):02d}"
+            normalized[(start, end)] = raw_to_stable[speaker]
+        return normalized
     
     def _find_speaker_for_segment(self, segment_start, segment_end, speaker_map) -> str:
         """Find the speaker that overlaps most with the given segment."""
@@ -265,8 +387,11 @@ class MeetingTranscriber:
             segments, info = self.model.transcribe(
                 audio_chunk,
                 language="en",
-                beam_size=5,
-                temperature=0
+                beam_size=WHISPER_BEAM_SIZE,
+                temperature=0,
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 350},
+                condition_on_previous_text=False,
             )
             
             segments_list = list(segments)
@@ -306,7 +431,10 @@ class MeetingTranscriber:
                         "text": text
                     }
                     chunk_data["segments"].append(segment_data)
-                    logger.info(f"  [{segment.start:.2f}s - {segment.end:.2f}s] {speaker_prefix}{text}")
+                    logger.info(
+                        f"  [{format_timestamp(segment_data['start'])} - "
+                        f"{format_timestamp(segment_data['end'])}] {speaker_prefix}{text}"
+                    )
             
             if chunk_data["segments"]:
                 return chunk_data
@@ -340,7 +468,11 @@ class MeetingTranscriber:
                     for segment in chunk_data["segments"]:
                         speaker = segment.get("speaker", "Unknown")
                         speaker_label = f"{speaker}: " if speaker != "Unknown" else ""
-                        f.write(f"[{segment['start']:.2f}s - {segment['end']:.2f}s] {speaker_label}{segment['text']}\n")
+                        f.write(
+                            f"[{format_timestamp(segment['start'])} - "
+                            f"{format_timestamp(segment['end'])}] "
+                            f"{speaker_label}{segment['text']}\n"
+                        )
             
             logger.info(f"Transcript saved to: {self.transcript_file}")
             
@@ -411,7 +543,7 @@ class MeetingTranscriber:
                 
                 if result:
                     self.transcripts.append(result)
-                    logger.info(f"✓ Chunk {chunk_num} transcribed successfully")
+                    logger.info(f"Chunk {chunk_num} transcribed successfully")
                 
                 logger.info("-"*60)
                 
@@ -436,6 +568,9 @@ def main():
     parser.add_argument("--device", type=int, default=None, help="Audio device ID")
     parser.add_argument("--select-device", action="store_true", help="Interactive device selection")
     parser.add_argument("--hf-token", type=str, default=None, help="HuggingFace token for speaker diarization")
+    parser.add_argument("--list-devices", action="store_true", help="List audio devices and exit")
+    parser.add_argument("--debug-audio", action="store_true", help="Show live RMS/peak diagnostics without loading ML models")
+    parser.add_argument("--debug-seconds", type=int, default=30, help="Seconds to run --debug-audio")
     
     args = parser.parse_args()
     
@@ -445,6 +580,14 @@ def main():
     device = args.device
     if args.select_device:
         device = select_audio_device()
+
+    if args.list_devices:
+        list_audio_devices()
+        return
+
+    if args.debug_audio:
+        debug_audio(device=device, seconds=args.debug_seconds)
+        return
     
     try:
         transcriber = MeetingTranscriber(device=device, model_size=args.model, hf_token=hf_token)

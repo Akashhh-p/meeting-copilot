@@ -1,0 +1,54 @@
+{
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
+    "devPath": "http://127.0.0.1:8012",
+    "distDir": "../dist"
+  },
+  "package": {
+    "productName": "Meeting Co-Pilot",
+    "version": "1.0.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false,
+      "shell": {
+        "all": false,
+        "sidecar": true,
+        "scope": [
+          {
+            "name": "meeting-copilot-server",
+            "sidecar": true
+          }
+        ]
+      }
+    },
+    "bundle": {
+      "active": true,
+      "targets": "all",
+      "identifier": "com.meetingcopilot.app",
+      "externalBin": [
+        "bin/meeting-copilot-server"
+      ],
+      "windows": {
+        "webviewInstallMode": {
+          "type": "downloadBootstrapper"
+        }
+      }
+    },
+    "security": {
+      "csp": null
+    },
+    "systemTray": {},
+    "windows": [
+      {
+        "title": "Meeting Co-Pilot",
+        "width": 1280,
+        "height": 820,
+        "resizable": true,
+        "fullscreen": false,
+        "url": "http://127.0.0.1:8012"
+      }
+    ]
+  }
+}

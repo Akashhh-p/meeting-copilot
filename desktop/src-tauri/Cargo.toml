@@ -1,0 +1,15 @@
+[package]
+name = "meeting-copilot"
+version = "1.0.0"
+description = "Meeting Co-Pilot desktop shell"
+authors = ["Meeting Co-Pilot"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+tauri = { version = "1.6", features = ["shell-sidecar", "system-tray"] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
